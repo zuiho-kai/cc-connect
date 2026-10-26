@@ -70,6 +70,8 @@ func (s *tooLongSession) Send(prompt string, _ string, _ []ImageAttachment, _ []
 	emit := func(next string) {
 		if next == "long" {
 			s.events <- Event{Type: EventError, Error: errors.New(tooLongErrText)}
+		} else if next == "413" {
+			s.events <- Event{Type: EventError, Error: errors.New("unexpected status 413 Payload Too Large")}
 		} else if next == "503" {
 			s.events <- Event{Type: EventError, Error: errors.New(noChannelErrText)}
 		} else {
@@ -242,5 +244,60 @@ func TestPromptTooLong_MessageQueuedDuringRecycleKept(t *testing.T) {
 	sent, by, _ := a.snapshot()
 	if len(sent) != 3 || !strings.HasSuffix(sent[1], "hello") || !strings.HasSuffix(sent[2], "msgLate") || by[2] != "s2" {
 		t.Fatalf("sends = %q on %q, want hello on s1, then hello and msgLate on s2", sent, by)
+	}
+}
+
+func TestIsPromptTooLongError_HTTP413(t *testing.T) {
+	for _, tt := range []struct {
+		message string
+		want    bool
+	}{
+		{"prompt is too long: 100 tokens > 50 maximum", true},
+		{"unexpected status 413 Payload Too Large", true},
+		{"request failed: status 413", true},
+		{"HTTP 413 PAYLOAD TOO LARGE", true},
+		{"unexpected status 503 Service Unavailable", false},
+		{"request failed: status 403", false},
+		{"request ID 413", false},
+	} {
+		t.Run(tt.message, func(t *testing.T) {
+			if got := IsPromptTooLongError(tt.message); got != tt.want {
+				t.Fatalf("IsPromptTooLongError(%q) = %v, want %v", tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPromptTooLong_HTTP413FreshSessionRerunsOnce(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e, a := newTooLongEngine(t, p, "413", "again")
+	e.i18n = NewI18n(LangChinese)
+	e.handleMessage(p, &Message{SessionKey: "test:c1", Platform: "test", UserID: "u", Content: "hello", ReplyCtx: "ctx"})
+	waitFor(t, "413 recovery reply", func() bool { return strings.Contains(joined(p), "reply:again") })
+	waitFor(t, "session released", func() bool { return !e.sessions.GetOrCreateActive("test:c1").Busy() })
+	sent, by, starts := a.snapshot()
+	if len(sent) != 2 || by[0] != "s1" || by[1] != "s2" || len(starts) != 2 || starts[1] != "" {
+		t.Fatalf("sends = %q on %q, starts = %q; want one fresh retry", sent, by, starts)
+	}
+	if !strings.Contains(sent[1], "旧会话里的话") || !strings.HasSuffix(sent[1], "hello") || !strings.Contains(sent[1], "请求体超过中转上限（413）") {
+		t.Fatalf("fresh retry lacks handoff, original message or 413 reason: %s", sent[1])
+	}
+	out := joined(p)
+	if strings.Count(out, "♻️") != 1 || !strings.Contains(out, "请求体超过中转上限（413）") || strings.Contains(out, "prompt is too long") || strings.Contains(out, "Payload Too Large") {
+		t.Fatalf("wrong recovery notice: %s", out)
+	}
+}
+
+func TestPromptTooLong_HTTP413RerunFailsAgainNoLoop(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e, a := newTooLongEngine(t, p, "413", "413", "never")
+	e.handleMessage(p, &Message{SessionKey: "test:c1", Platform: "test", UserID: "u", Content: "hello", ReplyCtx: "ctx"})
+	waitFor(t, "second 413 reported", func() bool { return strings.Contains(joined(p), "Payload Too Large") })
+	waitFor(t, "session released", func() bool { return !e.sessions.GetOrCreateActive("test:c1").Busy() })
+	if sent, _, starts := a.snapshot(); len(sent) != 2 || len(starts) != 2 {
+		t.Fatalf("sends = %d, starts = %d; want exactly one retry", len(sent), len(starts))
+	}
+	if out := joined(p); strings.Count(out, "♻️") != 1 {
+		t.Fatalf("wrong recovery count: %s", out)
 	}
 }

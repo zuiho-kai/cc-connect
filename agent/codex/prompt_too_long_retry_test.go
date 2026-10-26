@@ -86,6 +86,9 @@ func (w *scriptedSession) Send(string, string, []core.ImageAttachment, []core.Fi
 		n("error", tooLongRetryNotif)
 		n("error", `{"error":{"message":"Reconnecting... 2/5\n`+noChannel503+`"},"willRetry":true}`)
 		n("turn/completed", `{"threadId":"t","turn":{"id":"`+turn+`","status":"failed","error":{"message":"`+noChannel503+`"}}}`)
+	case "413retry":
+		n("error", `{"error":{"message":"Reconnecting... 1/5\nunexpected status 413 Payload Too Large"},"willRetry":true}`)
+		// No terminal notification: recovery must begin at the first retry.
 	case "503":
 		n("turn/completed", `{"threadId":"t","turn":{"id":"`+turn+`","status":"failed","error":{"message":"`+noChannel503+`"}}}`)
 	default:
@@ -138,5 +141,43 @@ func TestEngine_Only503NoFreshSession(t *testing.T) {
 	}
 	if out := p.out(); strings.Contains(out, "♻️") || strings.Contains(out, "reply:never") {
 		t.Fatalf("channel:\n%s", out)
+	}
+}
+
+func TestAppServerSession_HTTP413RetryFailsImmediately(t *testing.T) {
+	for _, message := range []string{"unexpected status 413 Payload Too Large", "upstream status 413"} {
+		t.Run(message, func(t *testing.T) {
+			s := &appServerSession{events: make(chan core.Event, 4), currentTurn: "turn-1"}
+			notif, err := json.Marshal(map[string]any{"error": map[string]string{"message": message}, "willRetry": true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.handleNotification("error", notif)
+			if len(s.events) != 1 || s.currentTurn != "" {
+				t.Fatalf("first retry emitted %d events, turn = %q; want immediate failure", len(s.events), s.currentTurn)
+			}
+			ev := <-s.events
+			if ev.Type != core.EventError || ev.Error == nil || ev.Error.Error() != message {
+				t.Fatalf("event = %+v, want original 413 error", ev)
+			}
+			s.handleNotification("error", notif)
+			s.handleNotification("turn/completed", json.RawMessage(failed503Notif))
+			if len(s.events) != 0 {
+				t.Fatalf("late notifications emitted %d duplicate events", len(s.events))
+			}
+		})
+	}
+}
+
+func TestEngine_HTTP413RetryStartsFreshWithoutTerminalNotification(t *testing.T) {
+	p, a := runCronScript(t, "ok", "413retry", "again")
+	a.mu.Lock()
+	by, starts := append([]string(nil), a.sentBy...), append([]string(nil), a.starts...)
+	a.mu.Unlock()
+	if len(by) != 3 || by[1] != "s1" || by[2] != "s2" || len(starts) != 2 || starts[1] != "" {
+		t.Fatalf("sends on %q, starts %q; want the cron job re-run once on fresh s2", by, starts)
+	}
+	if out := p.out(); strings.Count(out, "♻️") != 1 || !strings.Contains(out, "reply:again") || strings.Contains(out, "prompt is too long") {
+		t.Fatalf("channel: %s", out)
 	}
 }
